@@ -1,0 +1,27 @@
+# Lines starting with '#' are considered comments.
+#
+# Ignore binary code
+*/bin/**
+/bin
+target
+lib_managed
+
+A30000
+
+# Ignore IntelliJ IDEA files,
+*.iml
+.idea
+
+# Ignore Eclipse IDE files
+.settings
+.project
+.classpath
+
+release.properties
+
+# Ignore MacOS X files
+.DS_Store
+
+# Emacs temporary files
+*~
+
