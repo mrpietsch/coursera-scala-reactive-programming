@@ -19,8 +19,6 @@ class EpidemySimulator extends Simulator {
     val mortabilityRate = 0.25
     val timeToGetImmune = 16
     val timeToGetHealthy = 18
-
-    // to complete: additional parameters of simulation
   }
 
   import SimConfig._
@@ -58,14 +56,14 @@ class EpidemySimulator extends Simulator {
 
     def beHealthy() = {
       infected = false
-      // sick = false
+      sick = false
       immune = false
     }
 
     def beImmuneAndGetHealthySoon() = {
       sick = false
       immune = true
-      // infected = true
+      infected = true
       afterDelay(timeToGetHealthy - timeToGetImmune)(beHealthy())
     }
 
@@ -90,6 +88,9 @@ class EpidemySimulator extends Simulator {
     }
 
     def infect() {
+      dead = false
+      sick = false
+      immune = false
       infected = true
       afterDelay(incubationTime)(beSick())
     }
@@ -116,27 +117,30 @@ class EpidemySimulator extends Simulator {
 
     def move() {
 
-      val noOneIsSickPredicate: ((Int, Int)) => Boolean = {
-        case (r,c) => personsInRoom(r,c).filter(_.sick).isEmpty
+
+      if (!dead) {
+        val noOneIsSickPredicate: ((Int, Int)) => Boolean = {
+          case (r, c) => personsInRoom(r, c).filter(_.sick).isEmpty
+        }
+
+        // look around and filter rooms with obviously sick / dead persons
+        val walkableRooms: List[(Int, Int)] = for (
+          room <- calculateNeighbors() if noOneIsSickPredicate(room._1, room._2)
+        ) yield room
+
+        if (!walkableRooms.isEmpty) {
+          val randomIndex: Int = randomBelow(walkableRooms.size)
+          val randomNeighbor: (Int, Int) = walkableRooms(randomIndex)
+
+          // go to that room
+          row = randomNeighbor._1
+          col = randomNeighbor._2
+
+          infectProbably()
+        }
+        triggerMove()
       }
 
-      // look around and filter rooms with obviously sick / dead persons
-      val walkableRooms: List[(Int, Int)] = for (
-        room <- calculateNeighbors() if noOneIsSickPredicate(room._1, room._2)
-      ) yield room
-
-      if ( ! walkableRooms.isEmpty ) {
-        val randomIndex: Int = randomBelow(walkableRooms.size)
-        val randomNeighbor: (Int, Int) = walkableRooms(randomIndex)
-
-        // go to that room
-        row = randomNeighbor._1
-        col = randomNeighbor._2
-
-        infectProbably()
-      }
-
-      if (!dead) triggerMove()
     }
 
 
