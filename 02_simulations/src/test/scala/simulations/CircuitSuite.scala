@@ -97,7 +97,7 @@ class CircuitSuite extends CircuitSimulator with FunSuite {
     println("OUT: " + outSignal.map(_.getSignal))
 
     // expect the controlSignalAsInt's signal to be true
-    outSignal.zipWithIndex.foreach {
+    outSignal.reverse.zipWithIndex.foreach {
       case (wire, index) => {
         val expectedSignal = index == controlSignalAsInt
         assert(wire.getSignal === expectedSignal, s"Signal at index=$index should be $expectedSignal")
@@ -107,11 +107,11 @@ class CircuitSuite extends CircuitSimulator with FunSuite {
   }
 
   test("Demux") {
-
     testDemux(4, 8)
     testDemux(8, 3)
     testDemux(0, 0)
     testDemux(1, 0)
+    testDemux(3, 2)
     testDemux(1, 1)
   }
 

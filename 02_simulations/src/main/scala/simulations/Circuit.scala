@@ -89,26 +89,27 @@ abstract class CircuitSimulator extends Simulator {
   }
 
   def demux(in: Wire, c: List[Wire], out: List[Wire]) {
-    if (c.isEmpty) {
-       andGate(in, in, out.head)
-    } else {
-      val inDemuxLow  = new Wire
-      val inDemuxHigh = new Wire
+    c match {
 
-      val highestControl: Wire = c.head
-      val restOfControl: List[Wire] = c.tail
+      case Nil => andGate(in, in, out.head)
 
-      val highestControlInv = new Wire
-      inverter(highestControl, highestControlInv)
+      case highestControl :: restOfControl => {
 
-      andGate(highestControl, in, inDemuxHigh)
-      andGate(highestControlInv, in, inDemuxLow)
-      
-      val (outDemuxLow,outDemuxHigh) = out.splitAt(out.size/2)
+        val inDemuxLow = new Wire
+        val inDemuxHigh = new Wire
 
-      demux(inDemuxLow, restOfControl, outDemuxLow)
-      demux(inDemuxHigh, restOfControl, outDemuxHigh)
+        val highestControlInv = new Wire
+        inverter(highestControl, highestControlInv)
 
+        andGate(highestControl, in, inDemuxHigh)
+        andGate(highestControlInv, in, inDemuxLow)
+
+        val (outDemuxHigh, outDemuxLow) = out.splitAt(out.size / 2)
+
+        demux(inDemuxLow, restOfControl, outDemuxLow)
+        demux(inDemuxHigh, restOfControl, outDemuxHigh)
+
+      }
     }
   }
 

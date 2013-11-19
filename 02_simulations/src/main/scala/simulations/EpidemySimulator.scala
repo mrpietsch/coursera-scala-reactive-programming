@@ -13,10 +13,10 @@ class EpidemySimulator extends Simulator {
 
     val prevalenceRate = 0.01
     val transmissibilityRate = 0.4
+    val mortabilityRate = 0.25
 
     val incubationTime = 6
     val mortabilityTime = 14
-    val mortabilityRate = 0.25
     val timeToGetImmune = 16
     val timeToGetHealthy = 18
   }
@@ -29,9 +29,9 @@ class EpidemySimulator extends Simulator {
 
   // initially infect certain persons
   val initiallyInfected = (prevalenceRate * population).round.toInt
-  for (i <- 0 to initiallyInfected - 1) {
-    val randomIndex = randomBelow(300)
-    persons(randomIndex).infect()
+
+  for (p <- util.Random.shuffle(persons).take(initiallyInfected)) {
+    p.infect()
   }
 
   // initially start moving
@@ -78,13 +78,13 @@ class EpidemySimulator extends Simulator {
       if (random <= mortabilityRate) {
         beDead()
       } else {
-        afterDelay(timeToGetHealthy - mortabilityTime)(beImmuneAndGetHealthySoon())
+        afterDelay(timeToGetImmune - mortabilityTime)(beImmuneAndGetHealthySoon())
       }
     }
 
     def beSick() = {
       sick = true
-      afterDelay(mortabilityTime)(dieProbablyOrGetImmuneSoon())
+      afterDelay(mortabilityTime - incubationTime)(dieProbablyOrGetImmuneSoon())
     }
 
     def infect() {
@@ -98,7 +98,7 @@ class EpidemySimulator extends Simulator {
     def infectProbably() {
       if (!infected && !immune) {
         // find infected persons in the room
-        val infectedPersons = persons.filter(p => id != p.id && row == p.row && col == p.col && p.infected)
+        val infectedPersons = personsInRoom(row, col).filter(_.infected)
         if (!infectedPersons.isEmpty) {
           if (random <= transmissibilityRate) infect()
         }
@@ -115,9 +115,17 @@ class EpidemySimulator extends Simulator {
       persons.filter(p => id != p.id && r == p.row && c == p.col)
     }
 
+    /**
+     * Moves to a certain room
+     * @param r row of the room
+     * @param c column of the room
+     */
+    def moveTo(r: Int, c: Int) {
+
+    }
+
     def move() {
-
-
+      
       if (!dead) {
         val noOneIsSickPredicate: ((Int, Int)) => Boolean = {
           case (r, c) => personsInRoom(r, c).filter(_.sick).isEmpty
@@ -130,13 +138,13 @@ class EpidemySimulator extends Simulator {
 
         if (!walkableRooms.isEmpty) {
           val randomIndex: Int = randomBelow(walkableRooms.size)
-          val randomNeighbor: (Int, Int) = walkableRooms(randomIndex)
+          val (newRow, newCol) = walkableRooms(randomIndex)
 
-          // go to that room
-          row = randomNeighbor._1
-          col = randomNeighbor._2
+          row = newRow
+          col = newCol
 
           infectProbably()
+
         }
         triggerMove()
       }
