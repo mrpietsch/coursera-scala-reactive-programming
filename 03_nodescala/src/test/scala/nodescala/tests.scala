@@ -23,6 +23,64 @@ class NodeScalaSuite extends FunSuite {
     assert(Await.result(always, 0 nanos) == 517)
   }
 
+  test("Any Future should be returned") {
+
+    val list: List[Future[Int]] = List(Future { 1 }, Future { 2 }, Future { throw new Exception})
+
+    // run this test a couple of times and try to observer all possible return values at least once
+    val runs: Set[Try[Int]] = (1 to 10000).foldLeft(Set[Try[Int]]()){
+      case (acc, f) =>
+        acc + Try(Await.result(Future.any(list), 100 nanos))
+    }
+
+    assert(runs.size == list.size)
+  }
+
+  test("All Futures should complete successful") {
+    val f1 = Future.always(1)
+    val f2 = Future.always(2)
+    val f3 = Future.always(3)
+    val fs = List(f1, f2, f3)
+    val all = Future.all(fs)
+    val expected = List(1, 2, 3)
+
+    assert(Await.result(all, 1 second) === expected)
+  }
+
+  test("Delayed value should not be returned before delay is over") {
+    val f1 = Future.delay(1 second)
+    try {
+      Await.result(f1, 100 millis)
+      assert(false)
+    } catch {
+      case t: TimeoutException => // ok!
+    }
+  }
+
+  test("Delayed value should be returned after delay is over") {
+    val f1 = Future.delay(3 second)
+    try {
+      Await.result(f1, 5 second)
+      assert(true)
+    } catch {
+      case t: TimeoutException => // ok!
+    }
+  }
+
+
+  test("A Delayed Future should indeed delay") {
+    val testDuration: Int = 500
+    val waitDuration: Int = testDuration+100
+
+    var time = System.currentTimeMillis()
+
+    val delayFuture: Future[Unit] = Future.delay(testDuration milliseconds)
+
+    delayFuture.onComplete( _ => assert(System.currentTimeMillis() - time >= testDuration) )
+
+    Await.ready(delayFuture, waitDuration milliseconds)
+  }
+
   test("A Future should never be created") {
     val never = Future.never[Int]
 
@@ -50,6 +108,30 @@ class NodeScalaSuite extends FunSuite {
     cts.unsubscribe()
     assert(Await.result(p.future, 1 second) == "done")
   }
+
+//  test("Future.run") {
+//    var sign = false
+//
+//    val working = Future.run() {
+//      ct =>
+//        Future {
+//          while (ct.nonCancelled) {
+//            // doing something
+//          }
+//          sign = true
+//        }
+//    }
+//    Future.delay(1 seconds) onSuccess {
+//      case _ => working.unsubscribe()
+//    }
+//
+//    val asserter = Future.delay(2 seconds)
+//    asserter onSuccess {
+//      case _ => assert( sign )
+//    }
+//
+//    Await.ready(asserter, 3 seconds)
+//  }
 
   class DummyExchange(val request: Request) extends Exchange {
     @volatile var response = ""
@@ -149,6 +231,31 @@ class NodeScalaSuite extends FunSuite {
     test(immutable.Map("WorksForThree" -> List("Always works. Trust me.")))
 
     dummySubscription.unsubscribe()
+  }
+
+  test("Server should cancel a long-running or infinite response") {
+    def nextStream(lo: Int): Stream[String] = {
+      Stream.cons(lo + "", nextStream(lo + 1))
+    }
+    val dummy = new DummyServer(8191)
+    val dummySubscription = dummy.start("/testDir") {
+      request => Stream.cons(0 + "", nextStream(0)).iterator
+    }
+
+    // wait until server is really installed
+    Thread.sleep(500)
+
+    def test(req: Request) {
+      val webpage = dummy.emit("/testDir", req)
+      val content = Await.result(webpage.loaded.future, 5 second)
+    }
+
+    //    val future = Future.delay(2 seconds)
+    //    future.onComplete(t => {
+    //      dummySubscription.unsubscribe
+    //    })
+
+    test(immutable.Map("infinite" -> List("Does it work?")))
   }
 
 }
