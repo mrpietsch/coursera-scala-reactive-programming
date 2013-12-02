@@ -69,15 +69,12 @@ trait NodeScala {
     val working: Subscription = Future.run() {
       ct => future {
         while (ct.nonCancelled) {
-          val requestFuture: Future[(NodeScala.Request, Exchange)] = listener.nextRequest()
-          requestFuture.onSuccess {
+          listener.nextRequest().onSuccess {
 
             case (r, ex) => {
-              val handlerFuture: Future[NodeScala.Response] = future { handler(r) }
-              val handlerResult: NodeScala.Response = Await.result(handlerFuture, 1 seconds)
-              val responseFuture: Future[Unit] = future { respond(ex, ct, handlerResult) }
 
-              val responseResult: Try[Unit] = Try(Await.result(responseFuture, 3 seconds))
+              val responseFuture: Future[Unit] = future { respond(ex, ct, handler(r)) }
+              val responseResult: Try[Unit] = Try(Await.result(responseFuture, 1 seconds))
 
               responseResult match {
                 case Failure(t) => {
