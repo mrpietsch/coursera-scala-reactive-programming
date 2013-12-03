@@ -1,16 +1,16 @@
 package nodescala
 
-import scala.concurrent._
-import ExecutionContext.Implicits.global
-import scala.async.Async.async
-import scala.concurrent.duration._
 import scala.language.postfixOps
+
+import scala.concurrent._
+import scala.concurrent.duration._
+import ExecutionContext.Implicits.global
+import scala.async.Async.{ async, await }
 import scala.collection._
 import scala.collection.JavaConversions._
-import java.util.concurrent.{ThreadPoolExecutor, TimeUnit, LinkedBlockingQueue}
-import com.sun.net.httpserver.{HttpExchange, HttpHandler, HttpServer}
+import java.util.concurrent.{ ThreadPoolExecutor, TimeUnit, LinkedBlockingQueue }
+import com.sun.net.httpserver.{ HttpExchange, HttpHandler, HttpServer }
 import java.net.InetSocketAddress
-import scala.util.{Failure, Try, Success}
 
 /** Contains utilities common to the NodeScala© framework.
  */
@@ -31,24 +31,15 @@ trait NodeScala {
    *  @param response     the response to write back
    */
   private def respond(exchange: Exchange, token: CancellationToken, response: Response): Unit = {
-    if (token.nonCancelled && response.hasNext) {
 
-      val nextFuture: Future[String] = future {
-        response.next()
-      }
+    val delay: Future[Unit] = Future.delay(3 seconds)
 
-      val result: Try[String] = Try(Await.result(nextFuture, 2 seconds))
-
-      result match {
-        case Success(s) => {
-          exchange.write(s)
-          respond(exchange, token, response)
-        }
-        case Failure(t) => exchange.close()
-      }
-    } else {
-      exchange.close()
+    while (!delay.isCompleted && token.nonCancelled && response.hasNext) {
+      exchange.write(response.next())
     }
+
+    exchange.close()
+
   }
 
   /** A server:
@@ -62,33 +53,17 @@ trait NodeScala {
    *  @return               a subscription that can stop the server and all its asynchronous operations *entirely*.
    */
   def start(relativePath: String)(handler: Request => Response): Subscription = {
-
-    val listener: Listener = createListener(relativePath)
-    val listenerSubscription: Subscription = listener.start()
-
-    val working: Subscription = Future.run() {
-      ct => future {
+    val listener = createListener(relativePath)
+    val listenerSubscription = listener.start()
+    Future.run() { ct =>
+      async {
         while (ct.nonCancelled) {
-          listener.nextRequest().onSuccess {
-
-            case (r, ex) => {
-
-              val responseFuture: Future[Unit] = future { respond(ex, ct, handler(r)) }
-              val responseResult: Try[Unit] = Try(Await.result(responseFuture, 1 seconds))
-
-              responseResult match {
-                case Failure(t) => {
-                  ex.close()
-                }
-                case _ => // nothing
-              }
-            }
-          }
+          val (req, xchg) = await { listener.nextRequest() }
+          respond(xchg, ct, handler(req))
         }
+        listenerSubscription.unsubscribe()
       }
     }
-
-    Subscription(working, listenerSubscription)
   }
 
 }
@@ -108,7 +83,7 @@ object NodeScala {
 
   /** Used to write the response to the request.
    */
-  trait Exchange { 
+  trait Exchange {
     /** Writes to the output stream of the exchange.
      */
     def write(s: String): Unit
@@ -162,7 +137,7 @@ object NodeScala {
       val p = Promise[(NodeScala.Request, Exchange)]()
 
       createContext(ex => {
-        p.complete(Success(ex.request, ex))
+        p.success((ex.request, ex))
         removeContext()
       })
 

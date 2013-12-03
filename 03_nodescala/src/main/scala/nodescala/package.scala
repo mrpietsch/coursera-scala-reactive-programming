@@ -66,11 +66,9 @@ package object nodescala {
     def delay(t: Duration): Future[Unit] = {
       val p = Promise[Unit]()
 
-      p.completeWith {
-        async {
-          Await.ready(never, t)
-        }
-      }
+      val f: Future[Unit] = future { Try(Await.ready(never, t))}
+      p.completeWith(f)
+
       p.future
     }
 

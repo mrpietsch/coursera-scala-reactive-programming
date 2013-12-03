@@ -2,12 +2,11 @@ package nodescala
 
 import scala.language.postfixOps
 import scala.concurrent._
-import scala.concurrent.duration._
 import ExecutionContext.Implicits.global
-import scala.async.Async.{async, await}
+import scala.async.Async.async
 import scala.collection.Map
 import scala.concurrent.duration._
-import scala.util.{Success, Try}
+import scala.util.Success
 
 object Main {
 
@@ -36,7 +35,7 @@ object Main {
       val p = Promise[String]()
       val delayedFuture = Future.delay(20 seconds)
       delayedFuture onComplete {
-        _ => p.complete(Success(""))
+        _ => p.complete(Success("Server timeout!"))
       }
       p.future
     }
@@ -51,7 +50,7 @@ object Main {
     // TO IMPLEMENT
     // 5. unsubscribe from the server
     terminationRequested onSuccess {
-      case msg => myServerSubscription
+      case msg => myServerSubscription.unsubscribe()
     }
   }
 

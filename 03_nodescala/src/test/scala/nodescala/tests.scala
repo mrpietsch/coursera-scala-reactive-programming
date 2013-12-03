@@ -58,27 +58,12 @@ class NodeScalaSuite extends FunSuite {
   }
 
   test("Delayed value should be returned after delay is over") {
-    val f1 = Future.delay(3 second)
+    val f1 = Future.delay(1 seconds)
     try {
-      Await.result(f1, 5 second)
-      assert(true)
+      Await.result(f1, 3 seconds)
     } catch {
-      case t: TimeoutException => // ok!
+      case t: TimeoutException => fail(t.getMessage)
     }
-  }
-
-
-  test("A Delayed Future should indeed delay") {
-    val testDuration: Int = 500
-    val waitDuration: Int = testDuration+100
-
-    var time = System.currentTimeMillis()
-
-    val delayFuture: Future[Unit] = Future.delay(testDuration milliseconds)
-
-    delayFuture.onComplete( _ => assert(System.currentTimeMillis() - time >= testDuration) )
-
-    Await.ready(delayFuture, waitDuration milliseconds)
   }
 
   test("A Future should never be created") {
