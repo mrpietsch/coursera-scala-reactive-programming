@@ -67,4 +67,9 @@ class WikipediaApiTest extends FunSuite {
     }
     assert(total == (1 + 1 + 2 + 1 + 2 + 3), s"Sum: $total")
   }
+
+  test("timedOut (this test should also took about 1 second, not 70 seconds!)") {
+    val stream = Observable(1 to 100).zip(Observable.interval(700 millis))
+    assert(stream.timedOut(1).toBlockingObservable.toList === List((1,0)))
+  }
 }
