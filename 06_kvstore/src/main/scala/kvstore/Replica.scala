@@ -36,29 +36,86 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   import Persistence._
   import context.dispatcher
 
+  arbiter ! Join
+
   /*
    * The contents of this actor is just a suggestion, you can implement it in any way you like.
    */
-  
+
+  var expectedSeq : Long = 0
   var kv = Map.empty[String, String]
   // a map from secondary replicas to replicators
   var secondaries = Map.empty[ActorRef, ActorRef]
   // the current set of replicators
-  var replicators = Set.empty[ActorRef]
+//  var replicators = Set.empty[ActorRef]
 
   def receive = {
     case JoinedPrimary   => context.become(leader)
     case JoinedSecondary => context.become(replica)
   }
 
-  /* TODO Behavior for  the leader role. */
   val leader: Receive = {
-    case _ =>
+    case Insert(key, value, id) =>
+
+      kv = kv + (key -> value)
+      // inform our replicators of the change
+      secondaries.values foreach (_ ! Replicate(key, Some(value), id))
+
+      sender ! OperationAck(id)
+
+    case Remove(key, id) =>
+      kv = kv - key
+      // inform our replicators of the change
+      secondaries.values foreach (_ ! Replicate(key, None, id))
+
+      sender ! OperationAck(id)
+
+    case Get(key, id) =>
+      sender ! GetResult(key, kv.get(key), id)
+
+    case Replicas(newReplicaSet) =>
+      // skip us
+      val secondaryReplicas = newReplicaSet.filter( _ != self )
+
+      // calculate the difference
+      val newReplicas = secondaryReplicas -- secondaries.keySet
+      val deletedReplicas = secondaries.keySet -- secondaryReplicas
+
+      // stop all replicators whose replicas stopped working
+      deletedReplicas.flatMap(secondaries.get).foreach(context.stop)
+
+      // start replicator foreach new replica a remember the mapping
+      // todo synchronize with all data
+      val newReplicatorMappings = newReplicas.map( replica => (replica, context.actorOf(Replicator.props(replica))))
+
+      newReplicatorMappings.map(_._2).foreach {
+        r =>
+      }
+
+      // update our mapping
+      secondaries = (secondaries -- deletedReplicas) ++ newReplicatorMappings
+
   }
 
-  /* TODO Behavior for the replica role. */
   val replica: Receive = {
-    case _ =>
+    case Get(key, id) =>
+      sender ! GetResult(key, kv.get(key), id)
+
+    case Snapshot(key, valueOption, seq) if seq > expectedSeq  =>
+    case Snapshot(key, valueOption, seq) if seq < expectedSeq  => sender ! SnapshotAck(key, seq)
+    case Snapshot(key, valueOption, seq) if seq == expectedSeq  =>
+        valueOption match {
+          case Some(value) => kv = kv + (key -> value)
+          case None => kv = kv - key
+        }
+
+        expectedSeq = seq + 1
+        sender ! SnapshotAck(key, seq)
+
+
+    // case Replicas(newReplicators) => replicators = newReplicators
+    // case Insert(key, value, id) =>
+    // case Remove(key, id) =>
   }
 
 }
