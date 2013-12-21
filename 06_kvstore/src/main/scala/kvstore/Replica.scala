@@ -118,15 +118,28 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
     case Get(key, id) =>
       sender ! GetResult(key, kv.get(key), id)
 
+    case Persisted(k,s) => log.info(s"Persisted message $s for key $k ")
+
     case Snapshot(key, valueOption, seq) if seq > expectedSeq  =>
     case Snapshot(key, valueOption, seq) if seq < expectedSeq  => sender ! SnapshotAck(key, seq)
-    case Snapshot(key, valueOption, seq) if seq == expectedSeq  =>
-        valueOption match {
-          case Some(value) => kv = kv + (key -> value)
-          case None => kv = kv - key
+    case Snapshot(key, valueOption, seq) if seq == expectedSeq =>
+      valueOption match {
+        case Some(value) => kv = kv + (key -> value)
+        case None => kv = kv - key
+      }
+      expectedSeq = seq + 1
+
+      val ackknowlegmentReceiver = sender
+
+      val persistenceFuture: Future[Boolean] = persist(key, valueOption, seq, calculateMaxTime)
+
+      persistenceFuture.onComplete {
+        case Success(b) => {
+          log.warning(s"Sending SnapshotAck ${b}")
+          ackknowlegmentReceiver ! SnapshotAck(key, seq)
         }
-        expectedSeq = seq + 1
-        sender ! SnapshotAck(key, seq)
+        case Failure(e) =>log.warning(s"Failure ${e}")
+      }
 
 
     // case Replicas(newReplicators) => replicators = newReplicators
@@ -134,23 +147,19 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
     // case Remove(key, id) =>
   }
 
-
+  def calculateMaxTime = System.currentTimeMillis() + 1000
 
   def replicateAndPersist(ackReceiver : ActorRef, key: String, valueOption: Option[String], id: Long) {
 
-    val persistenceFuture: Future[Boolean] = persist(key, valueOption, id, System.currentTimeMillis() + 1000)
+    val persistenceFuture: Future[Boolean] = persist(key, valueOption, id, calculateMaxTime)
     val replicationFuture: Future[Boolean] = replicate(key, valueOption, id)
 
     val allOkFuture: Future[Boolean] = Future.reduce(List(persistenceFuture, replicationFuture))( (a,b) => a && b)
 
     allOkFuture.onComplete {
       case Success(true) => ackReceiver ! OperationAck(id)
-      case Success(false) =>
-        log.debug("Not all is good in the world")
-        ackReceiver ! OperationFailed(id)
-      case Failure(e) =>
-        log.error(e.getMessage,e)
-        ackReceiver ! OperationFailed(id)
+      case Success(false) => ackReceiver ! OperationFailed(id)
+      case Failure(_) =>  ackReceiver ! OperationFailed(id)
     }
   }
 
@@ -163,16 +172,14 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
         (sec ? Replicate(key, valueOption, id))
           .mapTo[Replicated]
           .map {
-          case Replicated(_, _) => {
+          case Replicated(_, _) =>
             log.info(s"Replicated $key to $sec" )
             true
-          }
         }
           .recover {
-          case e => {
+          case e =>
             log.warning(s"Replication failed ${e.getMessage}")
             false
-          }
         }
     }
 
@@ -193,9 +200,9 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
     askFuture.mapTo[Persisted]
       .map(_ => true)
       .recoverWith {
-      case _: Exception =>
+      case e: Exception =>
         if (System.currentTimeMillis() < maxTime)  {
-          log.info(s"Persistence failed... Retrying for $key" )
+          log.error(s"Persistence failed... Retrying for $key... Cause ${e.getMessage}")
           persist( key, valueOption, id, maxTime)   }
         else {
           log.warning(s"Giving up to persist $key" )
