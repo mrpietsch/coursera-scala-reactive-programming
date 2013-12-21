@@ -1,17 +1,21 @@
 package kvstore
 
-import akka.actor.{ OneForOneStrategy, Props, ActorRef, Actor }
+import akka.actor._
 import kvstore.Arbiter._
 import scala.collection.immutable.Queue
 import akka.actor.SupervisorStrategy.Restart
 import scala.annotation.tailrec
 import akka.pattern.{ ask, pipe }
-import akka.actor.Terminated
 import scala.concurrent.duration._
-import akka.actor.PoisonPill
-import akka.actor.OneForOneStrategy
-import akka.actor.SupervisorStrategy
 import akka.util.Timeout
+import scala.language.postfixOps
+import scala.Some
+import akka.actor.OneForOneStrategy
+import kvstore.Arbiter.Replicas
+import akka.actor.Terminated
+import scala.concurrent.Future
+import kvstore.Replicator.Replicate
+import scala.util.{Failure, Success}
 
 object Replica {
   sealed trait Operation {
@@ -30,11 +34,19 @@ object Replica {
   def props(arbiter: ActorRef, persistenceProps: Props): Props = Props(new Replica(arbiter, persistenceProps))
 }
 
-class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
+class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with ActorLogging {
   import Replica._
   import Replicator._
   import Persistence._
   import context.dispatcher
+
+  override val supervisorStrategy = OneForOneStrategy(-1, 100 milliseconds, loggingEnabled = true) {
+    case _: Exception => SupervisorStrategy.Restart
+  }
+
+  var persistence = context.actorOf(persistenceProps)
+  context.watch(persistence)
+
 
   arbiter ! Join
 
@@ -56,22 +68,21 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
 
   val leader: Receive = {
     case Insert(key, value, id) =>
-
       kv = kv + (key -> value)
-      // inform our replicators of the change
-      secondaries.values foreach (_ ! Replicate(key, Some(value), id))
-
-      sender ! OperationAck(id)
+      replicateAndPersist(sender, key, Some(value), id)
 
     case Remove(key, id) =>
       kv = kv - key
-      // inform our replicators of the change
-      secondaries.values foreach (_ ! Replicate(key, None, id))
-
-      sender ! OperationAck(id)
+      replicateAndPersist(sender, key, None, id)
 
     case Get(key, id) =>
       sender ! GetResult(key, kv.get(key), id)
+
+    case Replicated(key, id) =>
+      if ( id >= 0)
+
+      log.info(s"replicated id=$id, key=$key")
+
 
     case Replicas(newReplicaSet) =>
       // skip us
@@ -85,16 +96,22 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
       deletedReplicas.flatMap(secondaries.get).foreach(context.stop)
 
       // start replicator foreach new replica a remember the mapping
-      // todo synchronize with all data
       val newReplicatorMappings = newReplicas.map( replica => (replica, context.actorOf(Replicator.props(replica))))
 
-      newReplicatorMappings.map(_._2).foreach {
-        r =>
-      }
+      // todo synchronize with all data
+      val indexedKeyValue: Map[(String, String), Long] = kv.zipWithIndex.mapValues( i => -i)
+      val virginReplicators: Set[ActorRef] = newReplicatorMappings.map(_._2)
+
+      for (
+        repl <- virginReplicators;
+        ((k, v), i) <- indexedKeyValue
+      ) repl ! Replicate(k, Some(v), i)
+
 
       // update our mapping
       secondaries = (secondaries -- deletedReplicas) ++ newReplicatorMappings
 
+    case Terminated(p) => log.info(s"Termination message from $p")
   }
 
   val replica: Receive = {
@@ -108,7 +125,6 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
           case Some(value) => kv = kv + (key -> value)
           case None => kv = kv - key
         }
-
         expectedSeq = seq + 1
         sender ! SnapshotAck(key, seq)
 
@@ -116,6 +132,76 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
     // case Replicas(newReplicators) => replicators = newReplicators
     // case Insert(key, value, id) =>
     // case Remove(key, id) =>
+  }
+
+
+
+  def replicateAndPersist(ackReceiver : ActorRef, key: String, valueOption: Option[String], id: Long) {
+
+    val persistenceFuture: Future[Boolean] = persist(key, valueOption, id, System.currentTimeMillis() + 1000)
+    val replicationFuture: Future[Boolean] = replicate(key, valueOption, id)
+
+    val allOkFuture: Future[Boolean] = Future.reduce(List(persistenceFuture, replicationFuture))( (a,b) => a && b)
+
+    allOkFuture.onComplete {
+      case Success(true) => ackReceiver ! OperationAck(id)
+      case Success(false) =>
+        log.debug("Not all is good in the world")
+        ackReceiver ! OperationFailed(id)
+      case Failure(e) =>
+        log.error(e.getMessage,e)
+        ackReceiver ! OperationFailed(id)
+    }
+  }
+
+  def replicate(key: String, valueOption: Option[String], id: Long) : Future[Boolean] = {
+
+    implicit val timeout : Timeout = 1000.milliseconds
+
+    val secondaryResultFutures: Iterable[Future[Boolean]] = secondaries.values.map {
+      case sec: ActorRef =>
+        (sec ? Replicate(key, valueOption, id))
+          .mapTo[Replicated]
+          .map {
+          case Replicated(_, _) => {
+            log.info(s"Replicated $key to $sec" )
+            true
+          }
+        }
+          .recover {
+          case e => {
+            log.warning(s"Replication failed ${e.getMessage}")
+            false
+          }
+        }
+    }
+
+    Future.fold(secondaryResultFutures)(true)(_ && _)
+  }
+
+  /**
+   * todo repeatedly try to persist
+   * @param key key of the new entry
+   * @param valueOption the value of the new entry, {None} if it shall be removed
+   * @param id id of the request
+   */
+  def persist(key: String, valueOption: Option[String], id: Long, maxTime: Long): Future[Boolean] = {
+    implicit val timeout : Timeout = 100.milliseconds
+
+    val askFuture: Future[Any] = persistence ? Persist(key, valueOption, id)
+
+    askFuture.mapTo[Persisted]
+      .map(_ => true)
+      .recoverWith {
+      case _: Exception =>
+        if (System.currentTimeMillis() < maxTime)  {
+          log.info(s"Persistence failed... Retrying for $key" )
+          persist( key, valueOption, id, maxTime)   }
+        else {
+          log.warning(s"Giving up to persist $key" )
+          Future(false)
+        }
+    }
   }
 
 }
