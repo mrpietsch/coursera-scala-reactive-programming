@@ -63,7 +63,6 @@ class Replicator(val replica: ActorRef) extends Actor with ActorLogging{
       acks.get(seq) match {
         case Some((senderRef, originalReplicateRequest)) =>
           if ( pending.head.seq == seq) {
-            log.info("rcv " + seq)
             pending = pending.tail
             acks = acks - seq
             senderRef ! Replicated(originalReplicateRequest.key, originalReplicateRequest.id)

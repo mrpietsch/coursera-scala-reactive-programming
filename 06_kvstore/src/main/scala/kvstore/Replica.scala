@@ -47,19 +47,15 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
   var persistence = context.actorOf(persistenceProps)
   context.watch(persistence)
 
+  log.info(s"$self joining the cluster")
 
   arbiter ! Join
 
-  /*
-   * The contents of this actor is just a suggestion, you can implement it in any way you like.
-   */
-
   var expectedSeq : Long = 0
   var kv = Map.empty[String, String]
+
   // a map from secondary replicas to replicators
   var secondaries = Map.empty[ActorRef, ActorRef]
-  // the current set of replicators
-//  var replicators = Set.empty[ActorRef]
 
   def receive = {
     case JoinedPrimary   => context.become(leader)
@@ -71,6 +67,8 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
       kv = kv + (key -> value)
       replicateAndPersist(sender, key, Some(value), id)
 
+    case Persisted(k,s) => log.info(s"Leader Persisted message $s for key $k ")
+
     case Remove(key, id) =>
       kv = kv - key
       replicateAndPersist(sender, key, None, id)
@@ -80,33 +78,32 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
 
     case Replicated(key, id) =>
       if ( id >= 0)
-
       log.info(s"replicated id=$id, key=$key")
 
 
     case Replicas(newReplicaSet) =>
-      // skip us
+      // skip us since we are the primary
       val secondaryReplicas = newReplicaSet.filter( _ != self )
 
-      // calculate the difference
+      // calculate the difference to what we know
       val newReplicas = secondaryReplicas -- secondaries.keySet
       val deletedReplicas = secondaries.keySet -- secondaryReplicas
 
       // stop all replicators whose replicas stopped working
       deletedReplicas.flatMap(secondaries.get).foreach(context.stop)
 
-      // start replicator foreach new replica a remember the mapping
-      val newReplicatorMappings = newReplicas.map( replica => (replica, context.actorOf(Replicator.props(replica))))
+      // start replicator foreach new replica and remember the mapping
+      val newReplicatorMappings = for {
+        replica <- newReplicas
+        newReplicator = context.actorOf(Replicator.props(replica))
+      } yield (replica, newReplicator)
 
-      // todo synchronize with all data
-      val indexedKeyValue: Map[(String, String), Long] = kv.zipWithIndex.mapValues( i => -i)
-      val virginReplicators: Set[ActorRef] = newReplicatorMappings.map(_._2)
-
-      for (
-        repl <- virginReplicators;
-        ((k, v), i) <- indexedKeyValue
-      ) repl ! Replicate(k, Some(v), i)
-
+      // resend updates for all key-value tuple we know of using negative IDs
+      // to distinguish them from real updates
+      for {
+        (_, replicator) <- newReplicatorMappings
+        ((key, value), id) <- kv.zipWithIndex
+      } replicator ! Replicate(key, Some(value), -id)
 
       // update our mapping
       secondaries = (secondaries -- deletedReplicas) ++ newReplicatorMappings
@@ -115,11 +112,8 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
   }
 
   val replica: Receive = {
-    case Get(key, id) =>
-      sender ! GetResult(key, kv.get(key), id)
-
-    case Persisted(k,s) => log.info(s"Persisted message $s for key $k ")
-
+    case Get(key, id)                                          => sender ! GetResult(key, kv.get(key), id)
+    case Persisted(k,s)                                        => log.info(s"Persisted message $s for key $k ")
     case Snapshot(key, valueOption, seq) if seq > expectedSeq  =>
     case Snapshot(key, valueOption, seq) if seq < expectedSeq  => sender ! SnapshotAck(key, seq)
     case Snapshot(key, valueOption, seq) if seq == expectedSeq =>
@@ -129,22 +123,19 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
       }
       expectedSeq = seq + 1
 
+      // remember the current sender
+      // we could not inline this below and use `sender` directly since `sender` is defined as `def`
+      // and used in a future below... hence it could already return a different value when the future is ready
       val ackknowlegmentReceiver = sender
 
       val persistenceFuture: Future[Boolean] = persist(key, valueOption, seq, calculateMaxTime)
 
       persistenceFuture.onComplete {
-        case Success(b) => {
-          log.warning(s"Sending SnapshotAck ${b}")
+        case Success(b) =>
+          log.warning(s"Sending SnapshotAck $b")
           ackknowlegmentReceiver ! SnapshotAck(key, seq)
-        }
-        case Failure(e) =>log.warning(s"Failure ${e}")
+        case Failure(e) =>log.warning(s"Failure $e")
       }
-
-
-    // case Replicas(newReplicators) => replicators = newReplicators
-    // case Insert(key, value, id) =>
-    // case Remove(key, id) =>
   }
 
   def calculateMaxTime = System.currentTimeMillis() + 1000
@@ -154,7 +145,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
     val persistenceFuture: Future[Boolean] = persist(key, valueOption, id, calculateMaxTime)
     val replicationFuture: Future[Boolean] = replicate(key, valueOption, id)
 
-    val allOkFuture: Future[Boolean] = Future.reduce(List(persistenceFuture, replicationFuture))( (a,b) => a && b)
+    val allOkFuture: Future[Boolean] = Future.reduce(List(persistenceFuture, replicationFuture))(_ && _)
 
     allOkFuture.onComplete {
       case Success(true) => ackReceiver ! OperationAck(id)
@@ -195,7 +186,9 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
   def persist(key: String, valueOption: Option[String], id: Long, maxTime: Long): Future[Boolean] = {
     implicit val timeout : Timeout = 100.milliseconds
 
-    val askFuture: Future[Any] = persistence ? Persist(key, valueOption, id)
+    val persistRequest: Persist = Persist(key, valueOption, id)
+    log.info(s"Sending $persistRequest as $self to $persistence")
+    val askFuture: Future[Any] = persistence ? persistRequest
 
     askFuture.mapTo[Persisted]
       .map(_ => true)
