@@ -15,7 +15,7 @@ object Replicator {
   def props(replica: ActorRef): Props = Props(new Replicator(replica))
 }
 
-class Replicator(val replica: ActorRef) extends Actor with ActorLogging{
+class Replicator(val replica: ActorRef) extends Actor with ActorLogging {
   import Replicator._
   import Replica._
   import context.dispatcher

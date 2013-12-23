@@ -40,6 +40,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
   import Persistence._
   import context.dispatcher
 
+
   override val supervisorStrategy = OneForOneStrategy(-1, 100 milliseconds, loggingEnabled = true) {
     case _: Exception => SupervisorStrategy.Restart
   }
@@ -47,7 +48,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
   var persistence = context.actorOf(persistenceProps)
   context.watch(persistence)
 
-  log.info(s"$self joining the cluster")
+  log.info(s"$self is trying to join the cluster")
 
   arbiter ! Join
 
@@ -57,29 +58,55 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
   // a map from secondary replicas to replicators
   var secondaries = Map.empty[ActorRef, ActorRef]
 
+  // outstanding ackknowledgements
+  var owedSnapshotAcks = Map.empty[Long, (Long, String, ActorRef)] // seq -> (maxTime, key, originalSender)
+  var owedOperationAcks = Map.empty[Long, (Long, ActorRef)] // id -> (maxTime, originalSender)
+  var expectedAcknowledgementsReplication = Map.empty[Long,Set[ActorRef]]
+  var expectedAcknowledgementsPersistence = Map.empty[Long, Persist]
+
   def receive = {
-    case JoinedPrimary   => context.become(leader)
-    case JoinedSecondary => context.become(replica)
+    case JoinedPrimary   =>
+      context.system.scheduler.schedule(0 seconds, 100 milliseconds, self, "processAllOwedOperationAcks")
+      context.become(leader)
+    case JoinedSecondary =>
+      context.system.scheduler.schedule(0 seconds, 100 milliseconds, self, "processAllOwedSnapshotAcks")
+      context.become(replica)
   }
 
   val leader: Receive = {
+    case "processAllOwedOperationAcks" =>
+      owedOperationAcks.keys.foreach(checkGlobalAcknowledgementLeader)
+      
     case Insert(key, value, id) =>
       kv = kv + (key -> value)
-      replicateAndPersist(sender, key, Some(value), id)
+      replicateAndPersistLeader(sender, key, Some(value), id)
 
-    case Persisted(k,s) => log.info(s"Leader Persisted message $s for key $k ")
+    case Persisted(key,id) =>
+      log.info(s"Leader Persisted message $id for key $key")
+      expectedAcknowledgementsPersistence = expectedAcknowledgementsPersistence - id
+      // check if the replication is also ready and acknowledge if need be
+      checkGlobalAcknowledgementLeader(id)
+
+    case Replicated(key, id) =>
+      val replicator = sender
+      log.info(s"Leader Replicated message $id for key $key")
+      expectedAcknowledgementsReplication.get(id) match  {
+        case None => // ignored... OperationFailed has already been sent
+        case Some(actorRefSet) =>
+          val newActorRefSet = actorRefSet - replicator
+          expectedAcknowledgementsReplication = expectedAcknowledgementsReplication.updated(id, newActorRefSet)
+          if ( actorRefSet.isEmpty ) {
+            // check if the persistence is also ready and acknowledge if need be
+            checkGlobalAcknowledgementLeader(id)
+          }
+      }
 
     case Remove(key, id) =>
       kv = kv - key
-      replicateAndPersist(sender, key, None, id)
+      replicateAndPersistLeader(sender, key, None, id)
 
     case Get(key, id) =>
       sender ! GetResult(key, kv.get(key), id)
-
-    case Replicated(key, id) =>
-      if ( id >= 0)
-      log.info(s"replicated id=$id, key=$key")
-
 
     case Replicas(newReplicaSet) =>
       // skip us since we are the primary
@@ -112,96 +139,112 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
   }
 
   val replica: Receive = {
-    case Get(key, id)                                          => sender ! GetResult(key, kv.get(key), id)
-    case Persisted(k,s)                                        => log.info(s"Persisted message $s for key $k ")
-    case Snapshot(key, valueOption, seq) if seq > expectedSeq  =>
-    case Snapshot(key, valueOption, seq) if seq < expectedSeq  => sender ! SnapshotAck(key, seq)
-    case Snapshot(key, valueOption, seq) if seq == expectedSeq =>
+
+    case "processAllOwedSnapshotAcks" =>
+      owedSnapshotAcks.keys.foreach(checkGlobalAcknowledgementReplica)
+
+    case Get(key, id) =>
+      sender ! GetResult(key, kv.get(key), id)
+
+    case Persisted(key, id) =>
+      expectedAcknowledgementsPersistence = expectedAcknowledgementsPersistence - id
+      checkGlobalAcknowledgementReplica(id)
+
+    case sn@Snapshot(key, valueOption, seq) if seq > expectedSeq =>
+      log.info(s"Expecting sequence number $expectedSeq... Dropping future $sn")
+
+    case sn@Snapshot(key, valueOption, seq) if seq < expectedSeq =>
+      log.info(s"$sn has already been processed... Expecting sequence number $expectedSeq... Acknowledging again...")
+      sender ! SnapshotAck(key, seq)
+
+    case sn@Snapshot(key, valueOption, seq) if seq == expectedSeq =>
       valueOption match {
         case Some(value) => kv = kv + (key -> value)
         case None => kv = kv - key
       }
       expectedSeq = seq + 1
 
-      // remember the current sender
-      // we could not inline this below and use `sender` directly since `sender` is defined as `def`
-      // and used in a future below... hence it could already return a different value when the future is ready
-      val ackknowlegmentReceiver = sender
+      // remember that we have to send a SnapshotAck
+      owedSnapshotAcks = owedSnapshotAcks + (seq -> (calculateMaxTime, key, sender))
+      registerPersistRequest(key, valueOption, seq)
+      checkGlobalAcknowledgementReplica(seq)
+  }
 
-      val persistenceFuture: Future[Boolean] = persist(key, valueOption, seq, calculateMaxTime)
+  def checkGlobalAcknowledgementReplica(seq: Long) = {
+    owedSnapshotAcks.get(seq) match {
+      case None => log.info(s"$seq not found... no outstanding replication acks")
+      case Some((maxTime, key, originalSender)) =>
 
-      persistenceFuture.onComplete {
-        case Success(b) =>
-          log.warning(s"Sending SnapshotAck $b")
-          ackknowlegmentReceiver ! SnapshotAck(key, seq)
-        case Failure(e) =>log.warning(s"Failure $e")
-      }
+        if (!expectedAcknowledgementsPersistence.contains(seq)) {
+          originalSender ! SnapshotAck(key, seq)
+        }
+        else {
+          if (System.currentTimeMillis() > maxTime) {
+            expectedAcknowledgementsPersistence = expectedAcknowledgementsPersistence - seq
+            owedSnapshotAcks = owedSnapshotAcks - seq
+          } else {
+            // still in time, retry to persist if this was the error
+            expectedAcknowledgementsPersistence.get(seq) match {
+              case None => // nope, still waiting for the replication but not for the persistence
+              case Some(persistRequest) =>
+                // send persistence request
+                log.info(s"Sending $persistRequest as $self to $persistence")
+                persistence ! persistRequest
+            }
+          }
+        }
+
+    }
+  }
+
+  def checkGlobalAcknowledgementLeader(id: Long) = {
+    owedOperationAcks.get(id) match {
+      case None => log.info(s"$id not found in `owedOperationAcks`")
+      case Some((maxTime, originalSender)) =>
+        if (!expectedAcknowledgementsPersistence.contains(id) && expectedAcknowledgementsReplication.getOrElse(id, Set()).isEmpty) {
+          originalSender ! OperationAck(id)
+          expectedAcknowledgementsPersistence = expectedAcknowledgementsPersistence - id
+          expectedAcknowledgementsReplication = expectedAcknowledgementsReplication - id
+          owedOperationAcks = owedOperationAcks - id
+        } else {
+          if (System.currentTimeMillis() > maxTime) {
+            originalSender ! OperationFailed(id)
+            expectedAcknowledgementsPersistence = expectedAcknowledgementsPersistence - id
+            expectedAcknowledgementsReplication = expectedAcknowledgementsReplication - id
+            owedOperationAcks = owedOperationAcks - id
+          } else {
+            // still in time, retry to persist if this was the error
+            expectedAcknowledgementsPersistence.get(id) match {
+              case None => // nope, still waiting for the replication but not for the persistence
+              case Some(persistRequest) => persistence ! persistRequest
+            }
+          }
+        }
+    }
   }
 
   def calculateMaxTime = System.currentTimeMillis() + 1000
 
-  def replicateAndPersist(ackReceiver : ActorRef, key: String, valueOption: Option[String], id: Long) {
-
-    val persistenceFuture: Future[Boolean] = persist(key, valueOption, id, calculateMaxTime)
-    val replicationFuture: Future[Boolean] = replicate(key, valueOption, id)
-
-    val allOkFuture: Future[Boolean] = Future.reduce(List(persistenceFuture, replicationFuture))(_ && _)
-
-    allOkFuture.onComplete {
-      case Success(true) => ackReceiver ! OperationAck(id)
-      case Success(false) => ackReceiver ! OperationFailed(id)
-      case Failure(_) =>  ackReceiver ! OperationFailed(id)
-    }
+  def replicateAndPersistLeader(ackReceiver : ActorRef, key: String, valueOption: Option[String], id: Long) {
+    // remember that we have to send an OperationReply
+    owedOperationAcks = owedOperationAcks + (id -> (calculateMaxTime, sender))
+    registerPersistRequest(key, valueOption, id)
+    registerReplicationRequest(key, valueOption, id)
+    checkGlobalAcknowledgementLeader(id)
   }
 
-  def replicate(key: String, valueOption: Option[String], id: Long) : Future[Boolean] = {
-
-    implicit val timeout : Timeout = 1000.milliseconds
-
-    val secondaryResultFutures: Iterable[Future[Boolean]] = secondaries.values.map {
-      case sec: ActorRef =>
-        (sec ? Replicate(key, valueOption, id))
-          .mapTo[Replicated]
-          .map {
-          case Replicated(_, _) =>
-            log.info(s"Replicated $key to $sec" )
-            true
-        }
-          .recover {
-          case e =>
-            log.warning(s"Replication failed ${e.getMessage}")
-            false
-        }
-    }
-
-    Future.fold(secondaryResultFutures)(true)(_ && _)
+  def registerReplicationRequest(key: String, valueOption: Option[String], id: Long) = {
+    val replicators = secondaries.values
+    // send replication request to all replicators
+    replicators.foreach(_ ! Replicate(key, valueOption, id))
+    // remember that we are waiting for an answer
+    expectedAcknowledgementsReplication = expectedAcknowledgementsReplication + (id -> replicators.toSet)
   }
 
-  /**
-   * todo repeatedly try to persist
-   * @param key key of the new entry
-   * @param valueOption the value of the new entry, {None} if it shall be removed
-   * @param id id of the request
-   */
-  def persist(key: String, valueOption: Option[String], id: Long, maxTime: Long): Future[Boolean] = {
-    implicit val timeout : Timeout = 100.milliseconds
-
+  def registerPersistRequest(key: String, valueOption: Option[String], id: Long) {
     val persistRequest: Persist = Persist(key, valueOption, id)
-    log.info(s"Sending $persistRequest as $self to $persistence")
-    val askFuture: Future[Any] = persistence ? persistRequest
-
-    askFuture.mapTo[Persisted]
-      .map(_ => true)
-      .recoverWith {
-      case e: Exception =>
-        if (System.currentTimeMillis() < maxTime)  {
-          log.error(s"Persistence failed... Retrying for $key... Cause ${e.getMessage}")
-          persist( key, valueOption, id, maxTime)   }
-        else {
-          log.warning(s"Giving up to persist $key" )
-          Future(false)
-        }
-    }
+    // remember that we are waiting for an answer
+    expectedAcknowledgementsPersistence = expectedAcknowledgementsPersistence + (id -> persistRequest)
   }
 
 }
